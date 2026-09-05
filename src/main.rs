@@ -12,15 +12,38 @@ use songbird::{
     },
     SerenityInit,
 };
-use std::process::{Command, Stdio};
-use spotify::SpotifyResolver;
+use std::{
+    collections::HashSet,
+    process::{Command, Stdio},
+    sync::Arc,
+};
+use tokio::{
+    sync::Mutex,
+    time::{sleep, Duration, Instant},
+};
+use spotify::{SpotifyResolver, SpotifyTrackInfo};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
+const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
 #[derive(Clone)]
 struct Data {
     spotify: SpotifyResolver,
+    idle_monitors: Arc<Mutex<HashSet<serenity::GuildId>>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SearchCandidate {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    uploader: String,
+    duration: Option<f64>,
+    webpage_url: Option<String>,
+    url: Option<String>,
 }
 
 fn voice_channel(ctx: Context<'_>) -> Result<serenity::ChannelId> {
@@ -46,11 +69,183 @@ async fn ensure_joined(ctx: Context<'_>) -> Result<serenity::GuildId> {
         .ok_or_else(|| anyhow!("Songbird was not initialised."))?
         .clone();
 
-    if manager.get(guild_id).is_none() {
+    let needs_join = match manager.get(guild_id) {
+        Some(call) => {
+            let call = call.lock().await;
+            call.current_channel().is_none()
+        }
+        None => true,
+    };
+
+    if needs_join {
+        tracing::info!(%guild_id, %channel_id, "Joining or recovering voice connection");
         manager.join(guild_id, channel_id).await?;
     }
 
+    start_idle_monitor(ctx.data(), manager, guild_id).await;
+
     Ok(guild_id)
+}
+
+async fn start_idle_monitor(
+    data: &Data,
+    manager: Arc<songbird::Songbird>,
+    guild_id: serenity::GuildId,
+) {
+    {
+        let mut monitors = data.idle_monitors.lock().await;
+        if !monitors.insert(guild_id) {
+            return;
+        }
+    }
+
+    let monitors = Arc::clone(&data.idle_monitors);
+
+    tokio::spawn(async move {
+        let mut idle_since: Option<Instant> = None;
+
+        loop {
+            sleep(IDLE_POLL_INTERVAL).await;
+
+            let Some(call) = manager.get(guild_id) else {
+                break;
+            };
+
+            let queue_is_empty = {
+                let call = call.lock().await;
+                call.queue().len() == 0
+            };
+
+            if queue_is_empty {
+                let since = idle_since.get_or_insert_with(Instant::now);
+
+                if since.elapsed() >= IDLE_TIMEOUT {
+                    tracing::info!(%guild_id, "Disconnecting after voice inactivity");
+
+                    if let Err(error) = manager.remove(guild_id).await {
+                        tracing::warn!(%guild_id, %error, "Failed to disconnect idle voice call");
+                    }
+
+                    break;
+                }
+            } else {
+                idle_since = None;
+            }
+        }
+
+        monitors.lock().await.remove(&guild_id);
+    });
+}
+
+fn normalise(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn overlap_score(needle: &str, haystack: &str) -> i64 {
+    let needle = normalise(needle);
+    let haystack = normalise(haystack);
+
+    needle
+        .split_whitespace()
+        .filter(|word| word.len() > 1 && haystack.contains(word))
+        .count() as i64
+}
+
+fn best_spotify_match(track: &SpotifyTrackInfo) -> Result<String> {
+    let query = track.search_query();
+    let search = format!("ytsearch5:{query}");
+
+    let output = Command::new("yt-dlp")
+        .args([
+            "--no-warnings",
+            "--dump-json",
+            "--skip-download",
+            &search,
+        ])
+        .output()
+        .context("Failed to search YouTube with yt-dlp")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("yt-dlp search failed: {stderr}"));
+    }
+
+    let target_seconds = track.duration_ms as f64 / 1000.0;
+    let artist_text = track.artists.join(" ");
+
+    let mut best: Option<(i64, String)> = None;
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let candidate: SearchCandidate = match serde_json::from_str(line) {
+            Ok(candidate) => candidate,
+            Err(_) => continue,
+        };
+
+        let candidate_text = format!("{} {}", candidate.title, candidate.uploader);
+        let mut score = overlap_score(&track.title, &candidate_text) * 8;
+        score += overlap_score(&artist_text, &candidate_text) * 5;
+
+        if let Some(album) = &track.album {
+            score += overlap_score(album, &candidate_text) * 2;
+        }
+
+        if normalise(&candidate.title).contains(&normalise(&track.title)) {
+            score += 12;
+        }
+
+        if let Some(duration) = candidate.duration {
+            let delta = (duration - target_seconds).abs();
+            score += if delta <= 2.0 {
+                20
+            } else if delta <= 5.0 {
+                12
+            } else if delta <= 10.0 {
+                5
+            } else if delta >= 30.0 {
+                -15
+            } else {
+                0
+            };
+        }
+
+        let lower = candidate_text.to_ascii_lowercase();
+        if lower.contains("official audio") || lower.contains("provided to youtube") {
+            score += 5;
+        }
+        if lower.contains("live") && !track.title.to_ascii_lowercase().contains("live") {
+            score -= 8;
+        }
+        if lower.contains("remix") && !track.title.to_ascii_lowercase().contains("remix") {
+            score -= 8;
+        }
+
+        let url = candidate.webpage_url.or_else(|| {
+            candidate.url.map(|id| {
+                if id.starts_with("http://") || id.starts_with("https://") {
+                    id
+                } else {
+                    format!("https://www.youtube.com/watch?v={id}")
+                }
+            })
+        });
+
+        let Some(url) = url else {
+            continue;
+        };
+
+        if best.as_ref().map_or(true, |(best_score, _)| score > *best_score) {
+            best = Some((score, url));
+        }
+    }
+
+    best.map(|(_, url)| url)
+        .ok_or_else(|| anyhow!("No playable YouTube match found for {}", track.display_name()))
 }
 
 fn ffmpeg_input(target: &str, search: bool) -> Result<Input> {
@@ -133,6 +328,7 @@ async fn join(ctx: Context<'_>) -> Result<(), Error> {
         .clone();
 
     manager.join(guild_id, channel_id).await?;
+    start_idle_monitor(ctx.data(), manager, guild_id).await;
     ctx.say("Joined your voice channel.").await?;
     Ok(())
 }
@@ -158,7 +354,7 @@ async fn leave(ctx: Context<'_>) -> Result<(), Error> {
 #[poise::command(slash_command, guild_only)]
 async fn play(
     ctx: Context<'_>,
-    #[description = "YouTube/SoundCloud URL, Spotify track URL, or search text"]
+    #[description = "YouTube/SoundCloud URL, Spotify track/album/playlist URL, or search text"]
     #[rest]
     query: String,
 ) -> Result<(), Error> {
@@ -176,21 +372,39 @@ async fn play(
         .ok_or("Voice connection disappeared")?;
 
     let trimmed = query.trim();
-    let is_spotify = trimmed.starts_with("https://open.spotify.com/track/");
+    let is_spotify = trimmed.starts_with("https://open.spotify.com/");
 
-    let (input, label) = if is_spotify {
-        let search = ctx
+    if is_spotify {
+        let resource = ctx
             .data()
             .spotify
-            .track_to_search_query(trimmed)
+            .resolve(trimmed)
             .await
-            .context("Could not resolve Spotify track")?;
+            .context("Could not resolve Spotify URL")?;
 
-        (
-            ffmpeg_input(&search, true)?,
-            format!("Spotify → search: `{search}`"),
-        )
-    } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let label = resource.label();
+        let tracks = resource.into_tracks();
+
+        if tracks.is_empty() {
+            return Err(anyhow!("Spotify returned no playable tracks.").into());
+        }
+
+        let mut queued = 0usize;
+        for track in tracks {
+            let matched_url = best_spotify_match(&track)
+                .with_context(|| format!("Could not match {}", track.display_name()))?;
+            let input = ffmpeg_input(&matched_url, false)?;
+
+            let mut handler = handler_lock.lock().await;
+            handler.enqueue_input(input).await;
+            queued += 1;
+        }
+
+        ctx.say(format!("Queued {queued} track(s) from {label}.")).await?;
+        return Ok(());
+    }
+
+    let (input, label) = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         (
             ffmpeg_input(trimmed, false)?,
             format!("URL: <{trimmed}>"),
@@ -383,6 +597,7 @@ async fn main() -> Result<()> {
 
                 Ok(Data {
                     spotify: spotify.clone(),
+                    idle_monitors: Arc::new(Mutex::new(HashSet::new())),
                 })
             })
         })

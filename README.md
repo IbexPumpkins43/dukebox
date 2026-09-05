@@ -1,4 +1,6 @@
-# dukebox
+# Dukebox
+
+Dukebox is a deliberately small prototype Discord music bot written in Rust.
 
 ## Features
 
@@ -7,12 +9,13 @@
 - Play YouTube URLs
 - Play SoundCloud URLs through `yt-dlp`
 - Search YouTube when `/play` receives plain text
-- Spotify **track** URL resolution:
-  - reads track metadata from Spotify's Web API
-  - searches for a playable equivalent
+- Spotify track, album, and playlist URL resolution
+- Scores multiple YouTube candidates using title, artist, album, and duration metadata
 - Queue
 - Pause / resume / skip / stop
 - Uses Songbird for Discord voice
+- Recovers stale voice connections on the next play request
+- Disconnects after 5 minutes with an empty queue
 
 ## Configure
 
@@ -22,6 +25,8 @@ Create a `.env` file with:
 DISCORD_TOKEN=your_discord_bot_token
 SPOTIFY_CLIENT_ID=your_spotify_client_id
 SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
+# Required for playlist URLs under Spotify's current playlist API:
+SPOTIFY_REFRESH_TOKEN=your_spotify_refresh_token
 RUST_LOG=info
 ```
 
@@ -65,7 +70,7 @@ The first Cargo run will generate `Cargo.lock` if one does not already exist. On
 |---|---|
 | `/join` | Joins the voice channel you are currently in. |
 | `/leave` | Disconnects Dukebox from the voice channel. |
-| `/play <query-or-url>` | Queues a YouTube or SoundCloud URL, a Spotify track URL, or searches YouTube from plain text. |
+| `/play <query-or-url>` | Queues YouTube/SoundCloud URLs, Spotify tracks/albums/playlists, or searches YouTube from plain text. |
 | `/pause` | Pauses the current track. |
 | `/resume` | Resumes the paused track. |
 | `/skip` | Skips the current track and moves to the next queued item. |
@@ -104,12 +109,9 @@ For a large production bot, the next architectural decision would be whether to 
 
 ## TODO
 
-1. Spotify albums + playlists.
-2. Store rich queue metadata.
-3. Better matching of Spotify songs to playable results.
-4. Handle voice reconnects and idle disconnects.
-5. Add `/nowplaying`.
-6. Add per-guild volume.
-7. Add structured errors and health metrics.
-8. Load tests with many guild queues.
-9. Consider Lavalink nodes once concurrent playback becomes large.
+1. Store rich queue metadata.
+2. Add `/nowplaying`.
+3. Add per-guild volume.
+4. Add structured errors and health metrics.
+5. Load tests with many guild queues.
+6. Consider Lavalink nodes once concurrent playback becomes large.
